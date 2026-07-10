@@ -1,300 +1,254 @@
-# JAS RAG
+# JAS RAG Architecture
 
-Just Another Simple RAG.
+JAS RAG is a local-first retrieval baseline. It uses SQLite FTS5 for keyword retrieval, stores both document-level and chunk-level indexes, then formats ranked chunks into LLM-ready context.
 
-JAS RAG is a tiny local RAG baseline powered by SQLite FTS5. It indexes Markdown files into documents and chunks, retrieves ranked chunks, and formats LLM-ready context without embeddings, vector databases, or external APIs.
+It does not use embeddings, a vector database, a reranker, or an external API.
 
-## Why this exists
+## System overview
 
-Most RAG demos start with embeddings, API keys, hosted vector databases, and enough moving parts to make debugging retrieval harder than building it. JAS RAG starts with the smallest useful baseline:
+```mermaid
+flowchart TD
+    A["Markdown files"] --> C["KVIndex.add_file()"]
+    B["PDF / EPUB / HTML / text"] --> B1["Converter"]
+    B1 --> C
 
-- local-first storage
-- deterministic keyword retrieval
-- chunk-level search
-- no API quota
-- no private data included
-- a small retrieval eval harness
+    C --> D["Extract title + metadata"]
+    D --> E["Clean + chunk text"]
 
-Use it as a simple baseline before deciding whether vector search is actually needed.
+    E --> F["documents table"]
+    E --> G["docs_fts index"]
+    E --> H["chunks table"]
+    E --> I["chunks_fts index"]
 
-## Features
+    J["User query"] --> K["KnowledgeVault.query()"]
+    K --> L["ContextBuilder.build_with_search()"]
+    L --> I
+    I --> M["Ranked chunks"]
+    M --> N["Dedupe chunks"]
+    N --> O["Format context + sources"]
+    O --> P["LLM-ready context"]
 
-- SQLite FTS5 document and chunk index
-- Markdown indexing from a file or directory
-- Optional PDF, EPUB, HTML, and text conversion to Markdown
-- Chunk-aware context formatting for LLM prompts
-- Lightweight health checks for index integrity
-- Retrieval evaluation with golden queries
-- Public sample docs for testing
+    J --> Q["KnowledgeVault.search()"]
+    Q --> R["Librarian.select()"]
+    R --> G
+    G --> S["Ranked documents"]
+```
 
-## What this is not
+## Main components
 
-JAS RAG is intentionally boring.
+| Component | File | Role |
+| --- | --- | --- |
+| Orchestrator | `kv/__init__.py` | Public API that wires indexing, search, conversion, health, and context building |
+| CLI | `kv/__main__.py` | Command entry point for indexing, querying, stats, health, and repair |
+| SQLite index | `kv/sqlite/index.py` | Database schema, FTS5 indexes, file indexing, chunking, search, health, repair |
+| Context builder | `kv/builder/context.py` | Converts ranked chunks or documents into structured LLM-ready context |
+| Librarian | `kv/librarian/librarian.py` | Document-level search with simple intent/category/source heuristics |
+| Converter | `kv/sources/converter.py` | Optional PDF, EPUB, HTML, text, and Markdown conversion into Markdown |
+| Eval harness | `kv/eval_retrieval.py` | Golden-query retrieval checks for health, top-1, top-3, and empty results |
 
-- No embeddings
-- No vector database
-- No reranker
-- No chat UI
-- No hosted service
-- No private knowledge base data
+## Data model
 
-Add those only after eval results prove the simple FTS5 baseline is the bottleneck.
+```mermaid
+erDiagram
+    documents ||--o{ chunks : contains
+    documents ||--o{ docs_fts : indexed_by
+    chunks ||--o{ chunks_fts : indexed_by
 
-## Repository layout
+    documents {
+        integer id
+        text path
+        text filename
+        text source_type
+        text category
+        text title
+        text tags
+        text checksum
+        text created_at
+        text updated_at
+    }
+
+    chunks {
+        integer id
+        integer document_id
+        integer chunk_index
+        text content
+        integer start_line
+        integer end_line
+    }
+
+    docs_fts {
+        text document_id
+        text path
+        text source_type
+        text category
+        text title
+        text content
+        text tags
+    }
+
+    chunks_fts {
+        text chunk_id
+        text document_id
+        text content
+    }
+```
+
+## Indexing flow
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant CLI as CLI / KnowledgeVault
+    participant Index as KVIndex
+    participant DB as SQLite FTS5
+
+    User->>CLI: index file.md manual examples
+    CLI->>Index: add_file(path, source_type, category)
+    Index->>Index: read UTF-8 content
+    Index->>Index: extract title
+    Index->>Index: compute checksum
+    Index->>DB: upsert documents row
+    Index->>DB: replace docs_fts row
+    Index->>Index: clean + classify + chunk
+    Index->>DB: insert chunks
+    Index->>DB: insert chunks_fts rows
+    Index-->>CLI: indexed / unchanged
+```
+
+The checksum prevents unchanged files from being re-indexed. If a known file changes, old document and chunk FTS rows are removed before the new content is inserted.
+
+## Query flow
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant KV as KnowledgeVault
+    participant Builder as ContextBuilder
+    participant Index as KVIndex
+    participant DB as SQLite FTS5
+
+    User->>KV: query("how does chunk retrieval work")
+    KV->>Builder: build_with_search(query, top_k, max_tokens)
+    Builder->>Index: search_chunks(query, limit)
+    Index->>Index: build FTS OR query
+    Index->>DB: search chunks_fts MATCH query
+    DB-->>Index: ranked chunk rows
+    Index-->>Builder: chunks
+    Builder->>Builder: keep at most 2 chunks per document
+    Builder->>Builder: apply character budget
+    Builder->>Builder: format metadata + sources
+    Builder-->>KV: LLM-ready context
+    KV-->>User: context
+```
+
+## Search flow
+
+`query` and `search` are different paths:
+
+- `query` searches chunks and returns formatted context.
+- `search` searches documents and returns document metadata.
+
+`search` uses `Librarian.select()`:
+
+1. Detect simple intent from keywords.
+2. Search priority categories first.
+3. Search all documents.
+4. Boost matches by source type, category, and title.
+5. Deduplicate by path.
+6. Return top documents.
+
+## Retrieval behavior
+
+JAS RAG builds FTS5 queries using OR logic across words. This favors recall over strict exact matching.
+
+Example:
 
 ```text
-kv/
-  __main__.py              CLI entry point
-  __init__.py              KnowledgeVault orchestrator
-  sqlite/index.py          SQLite tables, FTS5 indexes, chunking, search
-  builder/context.py       LLM-ready context builder
-  librarian/librarian.py   Intent-aware document selector
-  sources/converter.py     PDF/EPUB/HTML/text to Markdown converter
-  eval_retrieval.py        Retrieval eval harness
-  eval_queries.jsonl       Golden-query eval set
-  sample_docs/             Small public docs for smoke testing
+how does chunk retrieval work
 ```
 
-## Requirements
-
-- Python 3.10+
-- SQLite with FTS5 support
-- PyYAML
-
-Optional converter dependencies:
-
-- `pdfplumber` for PDF
-- `ebooklib` and `beautifulsoup4` for EPUB
-- `beautifulsoup4` for HTML
-
-## Install
-
-From the repository root:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
-```
-
-For the basic Markdown workflow, no optional converter dependency is needed.
-
-## Quick start
-
-Index the included sample docs:
-
-```bash
-python3 -m kv index-dir kv/sample_docs manual examples
-```
-
-Query the vault:
-
-```bash
-python3 -m kv query "how does chunk retrieval work"
-```
-
-Check index health:
-
-```bash
-python3 -m kv health
-```
-
-Run retrieval eval:
-
-```bash
-python3 -m kv.eval_retrieval
-```
-
-Expected sample result:
+becomes:
 
 ```text
-health: PASS
-cases: 4 (3 scored)
-top1: 3/3 (100%)
-top3: 3/3 (100%)
-empty: 1/1
+how OR does OR chunk OR retrieval OR work
 ```
 
-## Commands
+SQLite FTS5 ranks the matching rows. The context builder over-fetches chunk candidates, then keeps a diverse set by allowing at most two chunks from the same document.
 
-```bash
-python3 -m kv query "search text"
-python3 -m kv search "search text"
-python3 -m kv index path/to/file.md manual examples
-python3 -m kv index-dir path/to/docs manual examples
-python3 -m kv stats
-python3 -m kv health
-python3 -m kv repair-health
-python3 -m kv.eval_retrieval
-```
+## Chunking behavior
 
-### `query`
+The chunker is heuristic and intentionally simple:
 
-Returns formatted context for an LLM prompt.
+1. Strip YAML frontmatter.
+2. Strip HTML comments.
+3. Normalize whitespace.
+4. Classify content shape:
+   - structured
+   - list
+   - flat PDF
+   - narrative
+   - flat/reference
+5. Split by headings, sentences, line groups, or word windows depending on content shape.
+6. Merge tiny chunks.
+7. Hard-split pathological long chunks.
 
-```bash
-python3 -m kv query "golden queries top1 top3 retrieval"
-```
+Default targets:
 
-### `search`
+- approximate chunk size: 2000 characters
+- overlap: 300 characters
+- maximum chunk size: 4000 characters
 
-Returns matching documents with metadata.
+## Health checks
 
-```bash
-python3 -m kv search "index markdown files"
-```
-
-### `index`
-
-Indexes one Markdown file.
-
-```bash
-python3 -m kv index path/to/file.md manual examples
-```
-
-Arguments:
-
-- `path/to/file.md`: file to index
-- `manual`: source type
-- `examples`: optional category
-
-### `index-dir`
-
-Indexes all Markdown files under a directory.
-
-```bash
-python3 -m kv index-dir path/to/docs manual examples
-```
-
-### `health`
-
-Reports lightweight integrity checks:
+`python3 -m kv health` reports:
 
 - document count
+- document FTS row count
 - chunk count
-- orphan FTS rows
+- chunk FTS row count
+- orphan document FTS rows
+- orphan chunk FTS rows
 - uncategorized documents
 - oversized chunks
-- max chunk size
+- max chunk character count
 
-### `repair-health`
-
-Removes FTS rows whose parent document or chunk no longer exists.
-
-## Architecture
-
-```text
-Markdown / text / HTML / PDF / EPUB
-        |
-        v
-  optional converter
-        |
-        v
-  Markdown content
-        |
-        v
-  KVIndex.add_file()
-        |
-        +--> documents table
-        +--> docs_fts FTS5 index
-        +--> chunks table
-        +--> chunks_fts FTS5 index
-        |
-        v
-  ContextBuilder.build_with_search()
-        |
-        v
-  ranked chunks + source metadata
-        |
-        v
-  LLM-ready context
-```
-
-The main API is `KnowledgeVault` in `kv/__init__.py`. It wires together:
-
-- `KVIndex` for storage, indexing, chunking, search, health, and repair
-- `ContextBuilder` for LLM-ready output
-- `Librarian` for document-level search with simple intent heuristics
-- `Converter` for optional source conversion
-
-## Retrieval model
-
-JAS RAG uses SQLite FTS5 with `porter unicode61` tokenization.
-
-For `query`, retrieval happens at chunk level:
-
-1. Build an FTS query from user words with OR logic.
-2. Search `chunks_fts`.
-3. Rank using SQLite FTS5 rank.
-4. Over-fetch candidates.
-5. Deduplicate to keep at most two chunks per document.
-6. Format chunks with title, source type, category, chunk index, and source list.
-
-This keeps the system explainable: if a result is bad, you can inspect the chunk and query directly.
+`python3 -m kv repair-health` removes FTS rows whose parent rows no longer exist.
 
 ## Evaluation
 
-The eval harness lives in `kv/eval_retrieval.py`.
+The eval harness checks retrieval against `kv/eval_queries.jsonl`.
 
-It checks:
+It validates:
 
-- index health
-- expected top-1 retrieval
-- expected top-3 retrieval
+- health status
+- top-1 match rate
+- top-3 match rate
 - empty-result behavior
 
-Cases live in `kv/eval_queries.jsonl`.
-
 Run:
-
-```bash
-python3 -m kv.eval_retrieval
-```
-
-Strict mode for CI-style checks:
 
 ```bash
 python3 -m kv.eval_retrieval --strict
 ```
 
-JSON report:
+## Design tradeoffs
 
-```bash
-python3 -m kv.eval_retrieval --json
-```
-
-## Data and privacy
-
-This repository includes only small public sample docs. It intentionally excludes:
-
-- private knowledge-base data
-- SQLite database files
-- local absolute paths
-- workflow exports
-- auth files
-- API keys
-- embedding files
-
-The `.gitignore` excludes generated databases, Python caches, virtual environments, build outputs, and private converted vault output.
-
-## Limitations
-
-- Keyword retrieval can miss semantic matches when query terms differ from document terms.
-- Token counting is an estimate based on characters, not a model tokenizer.
-- Chunking is heuristic and optimized for simplicity.
-- Optional converters require extra dependencies.
-- There is no web UI or chat loop.
+| Decision | Benefit | Cost |
+| --- | --- | --- |
+| SQLite FTS5 instead of vector DB | Local, inspectable, no API, low setup | Weaker semantic matching |
+| Chunk-level retrieval for `query` | Better context precision | More moving parts than document-only search |
+| Document-level `search` path | Useful for browsing matches | Different behavior from `query` |
+| Character-based token estimate | No tokenizer dependency | Approximate budgets |
+| Heuristic chunking | Simple and dependency-light | Not ideal for every document type |
 
 ## When to add vector search
 
-Do not add vector search by default. Add it when all three are true:
+Add vector search only after the baseline proves insufficient:
 
-1. You have a golden-query eval set.
-2. Keyword retrieval fails important cases.
-3. The failed cases require semantic matching, not better chunking or better source text.
+1. Build a golden-query eval set.
+2. Confirm keyword retrieval fails important cases.
+3. Confirm failures are semantic, not caused by missing text, poor chunking, or weak queries.
+4. Add vector search as a separate retrieval path.
+5. Compare FTS5, vector, and hybrid results with the same eval set.
 
-Until then, FTS5 is easier to inspect, debug, ship, and maintain.
-
-## License
-
-MIT
+Until then, the FTS5 baseline is easier to debug, explain, and publish.
