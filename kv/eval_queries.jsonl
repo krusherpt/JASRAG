@@ -1,0 +1,4 @@
+{"id":"rag_basics","query":"how does chunk retrieval work","expect":{"title_contains":"RAG Basics","source_type":"manual","category":"examples","content_contains":"chunks"}}
+{"id":"indexing","query":"how do I index markdown files","expect":{"title_contains":"Indexing Guide","source_type":"manual","category":"examples","content_contains":"index-dir"}}
+{"id":"evaluation","query":"golden queries top1 top3 retrieval","expect":{"title_contains":"Evaluation Guide","source_type":"manual","category":"examples","content_contains":"top1"}}
+{"id":"empty_result","query":"zzzxxy nonexistentquery","expect_empty":true}

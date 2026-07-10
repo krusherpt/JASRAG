@@ -1,0 +1,9 @@
+[project]
+name = "jas-rag"
+version = "0.1.0"
+description = "Just Another Simple RAG"
+requires-python = ">=3.10"
+dependencies = ["PyYAML>=6.0"]
+
+[tool.setuptools]
+packages = ["kv", "kv.builder", "kv.librarian", "kv.sqlite", "kv.sources"]
