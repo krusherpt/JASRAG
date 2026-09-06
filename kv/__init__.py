@@ -56,7 +56,7 @@ class KnowledgeVault:
     
     def index_directory(self, dir_path: str, source_type: str = "manual",
                         category: str = None) -> list:
-        """Index all markdown files in a directory"""
+        """Index all indexable files in a directory (recursive; xberg for docs)"""
         return self.index.add_directory(dir_path, source_type, category)
     
     def convert_and_index(self, input_path: str, source_type: str = "manual",

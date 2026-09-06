@@ -12,11 +12,38 @@ Usage:
 import sqlite3
 import os
 import re
+import asyncio
+import hashlib
 from pathlib import Path
 from datetime import datetime
 
 DB_DIR = Path(__file__).parent
 DB_PATH = DB_DIR / "kv.db"
+
+# File types read directly as text (no xberg needed)
+TEXT_EXTENSIONS = {".md", ".markdown", ".txt", ".rst", ".text", ".log"}
+
+# Directories never worth descending into
+EXCLUDE_DIRS = {".git", ".hg", ".svn", "__pycache__", "node_modules",
+                ".venv", "venv", ".idea", ".vscode", "dist", "build",
+                ".extracted", ".cache", ".obsidian"}
+
+# Binary / archive / media extensions that are never indexed
+EXCLUDE_EXTENSIONS = {
+    # archives
+    ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar", ".zst",
+    # images
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff", ".ico", ".heic",
+    # audio/video
+    ".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus", ".mp4", ".mkv", ".avi",
+    ".mov", ".webm",
+    # fonts
+    ".ttf", ".otf", ".woff", ".woff2",
+    # executables & compiled
+    ".exe", ".dll", ".so", ".dylib", ".pyc", ".class", ".o", ".a", ".bin",
+    # databases
+    ".db", ".sqlite", ".sqlite3",
+}
 
 class KVIndex:
     """SQLite FTS5 index for Knowledge Vault"""
@@ -77,18 +104,62 @@ class KVIndex:
         """)
         self.conn.commit()
     
+    def _extract_text(self, path):
+        """Extract searchable text from a file.
+
+        - text/code extensions: read directly (fast)
+        - other extensions: run through xberg (107+ formats)
+        Returns str, or None if the file should be skipped.
+        """
+        p = Path(path)
+        suffix = p.suffix.lower()
+
+        if suffix in EXCLUDE_EXTENSIONS:
+            return None
+
+        # Fast path: known text formats read directly
+        if suffix in TEXT_EXTENSIONS:
+            try:
+                return p.read_text(encoding='utf-8', errors='replace')
+            except OSError:
+                return None
+
+        # Everything else: xberg detects the format from content/extension
+        # (PDF, DOCX, EPUB, HTML, code in 371 languages, spreadsheets, ...).
+        try:
+            import xberg
+            from xberg import ExtractInput, ExtractionConfig
+            result = asyncio.run(
+                xberg.extract(ExtractInput(uri=str(p)),
+                              ExtractionConfig(use_cache=False)))
+            if result.results:
+                return result.results[0].content or None
+            return None
+        except ImportError:
+            # xberg unavailable: only text files are indexable
+            if not suffix:
+                try:
+                    return p.read_text(encoding='utf-8', errors='replace')
+                except OSError:
+                    return None
+            return None
+        except Exception:
+            return None
+
     def add_file(self, path, source_type="manual", category=None, tags=None):
-        """Add a file to the index"""
+        """Add a file to the index (any supported format)"""
         path = str(Path(path).resolve())
-        
-        # Read file
-        with open(path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        
+
+        # Extract text content (xberg for documents, direct read for text)
+        content = self._extract_text(path)
+        if content is None:
+            return {"status": "skipped", "path": path,
+                    "reason": "unsupported or unreadable format"}
+
         # Extract metadata
         filename = Path(path).name
         title = self._extract_title(content, filename)
-        checksum = str(hash(content))
+        checksum = hashlib.sha256(content.encode('utf-8')).hexdigest()
         
         # Check if already indexed (skip if unchanged)
         existing = self.conn.execute(
@@ -150,10 +221,28 @@ class KVIndex:
         }
     
     def add_directory(self, dir_path, source_type="manual", category=None):
-        """Add all markdown files in a directory"""
+        """Add all indexable files in a directory (recursive).
+
+        Text/code files are read directly; documents (PDF, DOCX, HTML,
+        EPUB, ...) are extracted with xberg. Binaries, archives, and
+        media files are skipped; .git and similar dirs are excluded.
+        """
         results = []
-        for md_file in Path(dir_path).rglob("*.md"):
-            result = self.add_file(md_file, source_type, category)
+        root = Path(dir_path)
+        for file_path in root.rglob("*"):
+            if not file_path.is_file():
+                continue
+            # Skip excluded directories anywhere in the path
+            rel_parts = file_path.relative_to(root).parts
+            if any(part in EXCLUDE_DIRS for part in rel_parts):
+                continue
+            # Skip hidden files
+            if file_path.name.startswith("."):
+                continue
+            # Skip excluded extensions
+            if file_path.suffix.lower() in EXCLUDE_EXTENSIONS:
+                continue
+            result = self.add_file(file_path, source_type, category)
             results.append(result)
         return results
     
