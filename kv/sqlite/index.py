@@ -20,9 +20,6 @@ from datetime import datetime
 DB_DIR = Path(__file__).parent
 DB_PATH = DB_DIR / "kv.db"
 
-# File types read directly as text (no xberg needed)
-TEXT_EXTENSIONS = {".md", ".markdown", ".txt", ".rst", ".text", ".log"}
-
 # Directories never worth descending into
 EXCLUDE_DIRS = {".git", ".hg", ".svn", "__pycache__", "node_modules",
                 ".venv", "venv", ".idea", ".vscode", "dist", "build",
@@ -104,11 +101,15 @@ class KVIndex:
         """)
         self.conn.commit()
     
+    # Formats that benefit from xberg's conversion even though they're text
+    HTML_EXTENSIONS = {".html", ".htm", ".xhtml"}
+
     def _extract_text(self, path):
         """Extract searchable text from a file.
 
-        - text/code extensions: read directly (fast)
-        - other extensions: run through xberg (107+ formats)
+        - text/code files (no null bytes): read directly (fast)
+        - HTML: xberg (tags stripped to clean markdown)
+        - binaries (null bytes present): xberg (107+ formats)
         Returns str, or None if the file should be skipped.
         """
         p = Path(path)
@@ -117,31 +118,33 @@ class KVIndex:
         if suffix in EXCLUDE_EXTENSIONS:
             return None
 
-        # Fast path: known text formats read directly
-        if suffix in TEXT_EXTENSIONS:
-            try:
-                return p.read_text(encoding='utf-8', errors='replace')
-            except OSError:
-                return None
+        try:
+            raw = p.read_bytes()
+        except OSError:
+            return None
 
-        # Everything else: xberg detects the format from content/extension
-        # (PDF, DOCX, EPUB, HTML, code in 371 languages, spreadsheets, ...).
+        # HTML goes through xberg for clean tag-stripped markdown
+        if suffix in self.HTML_EXTENSIONS:
+            return self._xberg_text(raw, p.name)
+
+        # Null bytes => binary document (PDF, DOCX, EPUB, ...) => xberg
+        if b"\x00" in raw:
+            return self._xberg_text(raw, p.name)
+
+        # Plain text/code: index directly
+        return raw.decode("utf-8", errors="replace")
+
+    def _xberg_text(self, raw: bytes, filename: str = ""):
+        """Run xberg extraction over bytes; returns text or None on failure."""
         try:
             import xberg
-            from xberg import ExtractInput, ExtractionConfig
+            from xberg import ExtractInput, ExtractInputKind, ExtractionConfig
             result = asyncio.run(
-                xberg.extract(ExtractInput(uri=str(p)),
+                xberg.extract(ExtractInput(kind=ExtractInputKind.BYTES,
+                                           bytes=raw, filename=filename),
                               ExtractionConfig(use_cache=False)))
             if result.results:
                 return result.results[0].content or None
-            return None
-        except ImportError:
-            # xberg unavailable: only text files are indexable
-            if not suffix:
-                try:
-                    return p.read_text(encoding='utf-8', errors='replace')
-                except OSError:
-                    return None
             return None
         except Exception:
             return None
